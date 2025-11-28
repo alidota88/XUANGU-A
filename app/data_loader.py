@@ -50,67 +50,58 @@ def get_latest_trade_date() -> str:
 
 # ================== 股票基础信息 ==================
 
-def get_stock_list(force_update: bool = False) -> pd.DataFrame:
-    """
-    获取全市场 A 股列表（使用 Tushare stock_basic），可缓存到本地 CSV。
-    """
-    path = _csv_path("stock_list.csv")
-    if not force_update and os.path.exists(path):
-        return pd.read_csv(path, dtype={"code": str})
-
+def get_stock_list():
     pro = get_pro()
-    df = pro.stock_basic(
-        exchange="",
-        list_status="L",
-        fields="ts_code,symbol,name,industry,market,list_date",
-    )
-    # 统一字段名
-    df = df.rename(columns={"ts_code": "code"})
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+    try:
+        df = pro.stock_basic(exchange='', list_status='L',
+                             fields='ts_code,name,area,industry,list_date')
+    except Exception as e:
+        print("[data_loader] stock_basic 调用失败，使用最小字段兜底方案", e)
+        df = pro.stock_basic(exchange='', list_status='L',
+                             fields='ts_code,name,list_date')
+        df["industry"] = "未知"
+
+    # 强制 industry 存在
+    if "industry" not in df.columns:
+        df["industry"] = "未知"
+
+    df.rename(columns={"ts_code": "code"}, inplace=True)
     return df
+
 
 
 # ================== 成交额前 N 名（EOD，用日线 amount 排序） ==================
 
-def get_top_liquidity_stocks(top_n: int = 500) -> pd.DataFrame:
-    """
-    使用 Tushare daily 获取全市场日线，
-    再与 stock_basic 合并，补齐 'industry' 字段。
-    """
-
+def get_top_liquidity_stocks(top_n=500):
     pro = get_pro()
     trade_date = get_latest_trade_date()
+
     print(f"[data_loader] 获取 {trade_date} 全市场日线数据用于成交额排序")
 
-    # ---------- 1. 获取全市场日线 ----------
     daily = pro.daily(trade_date=trade_date)
-    if daily.empty:
-        raise RuntimeError("pro.daily 返回为空，请检查 Tushare token 或访问限制。")
 
-    # ---------- 2. 获取股票基础信息 ----------
+    if daily.empty:
+        raise Exception("Tushare daily 返回为空")
+
     stock_list = get_stock_list()
 
-    # 强制行业字段存在（部分股票行业为空）
+    # 保证 industry 字段存在
     stock_list["industry"] = stock_list["industry"].fillna("未知")
 
-    # ---------- 3. 合并 ----------
+    # merge
     df = daily.merge(stock_list, left_on="ts_code", right_on="code", how="left")
 
-    # 若行业仍有空值则继续填充
+    # 再兜底
     df["industry"] = df["industry"].fillna("未知")
     df["name"] = df["name"].fillna("未知")
 
-    # ---------- 4. 处理成交额 ----------
+    # 处理 amount
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
     df = df.dropna(subset=["amount"])
     df = df.sort_values("amount", ascending=False).head(top_n)
 
-    # ---------- 5. 返回固定字段 ----------
-    return df[[
-        "code", "name", "industry",
-        "close", "high", "low",
-        "vol", "amount"
-    ]]
+    return df[["code", "name", "industry", "close", "high", "low", "vol", "amount"]]
 
 
 

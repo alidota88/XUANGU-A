@@ -74,27 +74,44 @@ def get_stock_list(force_update: bool = False) -> pd.DataFrame:
 
 def get_top_liquidity_stocks(top_n: int = 500) -> pd.DataFrame:
     """
-    使用 Tushare pro.daily 获取最近一个交易日的全市场日线，
-    按 amount（成交额，单位：千元）排序，取前 top_n 作为候选池。
+    使用 Tushare daily 获取全市场日线，
+    再与 stock_basic 合并，补齐 'industry' 字段。
     """
+
     pro = get_pro()
     trade_date = get_latest_trade_date()
     print(f"[data_loader] 获取 {trade_date} 全市场日线数据用于成交额排序")
 
+    # ---------- 1. 获取全市场日线 ----------
     daily = pro.daily(trade_date=trade_date)
     if daily.empty:
-        raise RuntimeError("pro.daily 返回为空，检查 Tushare token 和权限。")
+        raise RuntimeError("pro.daily 返回为空，请检查 Tushare token 或访问限制。")
 
-    # 合并股票基本信息获取名称、行业
+    # ---------- 2. 获取股票基础信息 ----------
     stock_list = get_stock_list()
+
+    # 强制行业字段存在（部分股票行业为空）
+    stock_list["industry"] = stock_list["industry"].fillna("未知")
+
+    # ---------- 3. 合并 ----------
     df = daily.merge(stock_list, left_on="ts_code", right_on="code", how="left")
 
-    # 排序取前 top_n
+    # 若行业仍有空值则继续填充
+    df["industry"] = df["industry"].fillna("未知")
+    df["name"] = df["name"].fillna("未知")
+
+    # ---------- 4. 处理成交额 ----------
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
     df = df.dropna(subset=["amount"])
     df = df.sort_values("amount", ascending=False).head(top_n)
 
-    return df[["code", "name", "industry", "close", "high", "low", "vol", "amount"]]
+    # ---------- 5. 返回固定字段 ----------
+    return df[[
+        "code", "name", "industry",
+        "close", "high", "low",
+        "vol", "amount"
+    ]]
+
 
 
 # ================== 指数行情（用于 RS） ==================

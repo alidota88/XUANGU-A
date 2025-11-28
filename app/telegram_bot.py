@@ -1,4 +1,3 @@
-import textwrap
 from typing import Optional
 
 import pandas as pd
@@ -9,14 +8,14 @@ from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 def format_selection_for_telegram(df: pd.DataFrame, max_rows: int = 30) -> str:
     """
-    把选股结果格式成文本消息
+    把选股结果格式化为 Telegram 文本消息。
     """
     if df is None or df.empty:
-        return "今日没有符合条件的标的。"
+        return "📭 今日没有符合严格条件的标的。"
 
     lines = []
     lines.append("📈 今日量化选股结果（前 {} 只）".format(min(len(df), max_rows)))
-    lines.append("（已过滤：突破箱体+放量+主力净流入+主线板块+RS>0.7+得分>=80）")
+    lines.append("（条件：突破箱体+放量+主力 3 日净流入+主线板块+RS>0.7+得分>=80）")
     lines.append("")
 
     show_df = df.head(max_rows)
@@ -32,23 +31,22 @@ def format_selection_for_telegram(df: pd.DataFrame, max_rows: int = 30) -> str:
         lines.append(line)
 
     msg = "\n".join(lines)
-    # Telegram 单条消息限制 ~4096 字，这里做个简单截断
     return msg[:4000]
 
 
 def send_telegram_message(text: str) -> Optional[dict]:
     """
-    使用 Telegram Bot API 发送消息
+    使用 Telegram Bot API 发送消息。
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram] TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，跳过发送")
+        print("[telegram] TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，跳过发送。")
         return None
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",  # 备用，可以支持粗体等
+        "parse_mode": "HTML",
     }
 
     resp = requests.post(url, json=payload, timeout=15)

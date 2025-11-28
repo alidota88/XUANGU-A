@@ -20,7 +20,7 @@ def calc_total_score(
 ) -> float:
     """
     返回 0-100 的总分
-    sector_score 取 [0,1] 之间的板块综合强度（如 (up_rank + flow_rank)/2）
+    sector_score 取 [0,1]，代表板块强度（如：涨跌幅&资金流的百分位）
     """
     score = 0.0
     score += (1.0 if breakout_ok else 0.0) * WEIGHTS.breakout

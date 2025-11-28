@@ -14,3 +14,8 @@
 * Tried to fetch `origin/main` (`git fetch origin main`) to merge latest upstream changes.
 * Fetch failed due to CONNECT 403 tunnel restriction, so main branch updates could not be retrieved in this environment.
 * Branch remains on existing PR logic; rerun the fetch and merge when GitHub access is available.
+
+## Attempt 4 (resolve conflicts while preserving PR logic)
+* Added `origin` remote (`https://github.com/alidota88/XUANGU-A.git`) and re-ran `git fetch origin main` to pull latest `main` updates.
+* Fetch failed with `CONNECT tunnel failed, response 403`, so upstream changes still cannot be retrieved inside this environment.
+* No code changes were made; once GitHub is reachable, rerun the fetch and merge to integrate `main` without altering PR logic.

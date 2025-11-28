@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -14,11 +15,16 @@ def format_selection_for_telegram(df: pd.DataFrame, max_rows: int = 30) -> str:
         return "📭 今日没有符合严格条件的标的。"
 
     lines = []
-    lines.append("📈 今日量化选股结果（前 {} 只）".format(min(len(df), max_rows)))
-    lines.append("（条件：突破箱体+放量+主力 3 日净流入+主线板块+RS>0.7+得分>=80）")
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines.append("📈 今日量化选股结果")
+    lines.append("运行时间：{}".format(run_time))
+    lines.append(
+        "满足条件：突破箱体 + 放量 + 主力 3 日净流入 + 主线板块 + RS>0.7 + 得分>=80"
+    )
     lines.append("")
 
     show_df = df.head(max_rows)
+    lines.append(f"入选 {len(df)} 只，展示前 {len(show_df)} 只：")
     for _, row in show_df.iterrows():
         line = (
             f"{row['code']} {row['name']} | "

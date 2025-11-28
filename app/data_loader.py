@@ -184,6 +184,7 @@ def get_index_history(code: str | None = None, days: int = 250) -> pd.DataFrame:
         pro.index_daily,
         {"ts_code": code, "start_date": start, "end_date": latest},
     )
+    df = pro.index_daily(ts_code=code, start_date=start, end_date=latest)
     if df.empty:
         raise Exception(f"index_daily({code}) 返回为空")
 
@@ -209,6 +210,7 @@ def get_stock_history(code: str, days: int = 300) -> pd.DataFrame:
     df = _query_with_retry(
         pro.daily, {"ts_code": code, "start_date": start, "end_date": latest}
     )
+    df = pro.daily(ts_code=code, start_date=start, end_date=latest)
     if df.empty:
         return pd.DataFrame()
 
@@ -234,6 +236,7 @@ def get_stock_moneyflow(code: str, days: int = 20) -> pd.DataFrame:
     df = _query_with_retry(
         pro.moneyflow, {"ts_code": code, "start_date": start, "end_date": latest}
     )
+    df = pro.moneyflow(ts_code=code, start_date=start, end_date=latest)
     if df.empty:
         return pd.DataFrame()
 
@@ -257,6 +260,8 @@ def get_stock_moneyflow(code: str, days: int = 20) -> pd.DataFrame:
 
     turnover_safe = total_turnover.replace({0: pd.NA})
     ratio = (df["main_net_in"] / turnover_safe) * 100
+    with pd.option_context("mode.use_inf_as_na", True):
+        ratio = df["main_net_in"] / total_turnover.replace({0: pd.NA}) * 100
     df["main_net_ratio"] = ratio.fillna(0)
 
     df = df.sort_values("trade_date")

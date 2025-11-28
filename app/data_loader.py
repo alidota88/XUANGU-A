@@ -2,6 +2,7 @@ from .cache_manager import load_cache, save_cache
 # app/data_loader.py
 
 import os
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -18,6 +19,31 @@ def get_pro():
         raise Exception("环境变量 TUSHARE_TOKEN 未设置")
     ts.set_token(TS_TOKEN)
     return ts.pro_api()
+
+
+def _query_with_retry(api_func, kwargs: dict, retries: int = 3, delay: float = 1.0):
+    """
+    统一的 Tushare 调用重试逻辑，处理偶发的断开/超时。
+
+    说明：合并主干时保留了此前 PR 引入的重试行为，避免未来冲突时
+    不小心退回到无重试的旧实现。
+    """
+
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return api_func(**kwargs)
+        except Exception as e:  # noqa: PERF203 - 外部依赖调用需要兜底
+            last_err = e
+            if attempt == retries:
+                break
+            print(
+                f"[data_loader] {getattr(api_func, '__name__', str(api_func))} 失败"
+                f"(第 {attempt}/{retries} 次)：{e}，重试中..."
+            )
+            time.sleep(delay)
+
+    raise last_err  # type: ignore[misc]
 
 
 def _load_cached_df(name: str) -> pd.DataFrame | None:
@@ -70,17 +96,23 @@ def get_stock_list() -> pd.DataFrame:
             return pd.DataFrame(cached_data)
 
     try:
-        df = pro.stock_basic(
-            exchange="",
-            list_status="L",
-            fields="ts_code,name,area,industry,list_date",
+        df = _query_with_retry(
+            pro.stock_basic,
+            {
+                "exchange": "",
+                "list_status": "L",
+                "fields": "ts_code,name,area,industry,list_date",
+            },
         )
     except Exception as e:
         print("[data_loader] stock_basic 调用失败，使用兜底字段", e)
-        df = pro.stock_basic(
-            exchange="",
-            list_status="L",
-            fields="ts_code,name,list_date",
+        df = _query_with_retry(
+            pro.stock_basic,
+            {
+                "exchange": "",
+                "list_status": "L",
+                "fields": "ts_code,name,list_date",
+            },
         )
         df["industry"] = "未知"
 
@@ -106,7 +138,7 @@ def get_top_liquidity_stocks(top_n: int = 500) -> pd.DataFrame:
     trade_date = get_latest_trade_date()
     print(f"[data_loader] 获取 {trade_date} 全市场日线数据用于成交额排序")
 
-    daily = pro.daily(trade_date=trade_date)
+    daily = _query_with_retry(pro.daily, {"trade_date": trade_date})
     if daily.empty:
         raise Exception(f"Tushare daily({trade_date}) 返回为空")
 
@@ -148,6 +180,10 @@ def get_index_history(code: str | None = None, days: int = 250) -> pd.DataFrame:
         return cache_df
 
     pro = get_pro()
+    df = _query_with_retry(
+        pro.index_daily,
+        {"ts_code": code, "start_date": start, "end_date": latest},
+    )
     df = pro.index_daily(ts_code=code, start_date=start, end_date=latest)
     if df.empty:
         raise Exception(f"index_daily({code}) 返回为空")
@@ -171,6 +207,9 @@ def get_stock_history(code: str, days: int = 300) -> pd.DataFrame:
         return cache_df
 
     pro = get_pro()
+    df = _query_with_retry(
+        pro.daily, {"ts_code": code, "start_date": start, "end_date": latest}
+    )
     df = pro.daily(ts_code=code, start_date=start, end_date=latest)
     if df.empty:
         return pd.DataFrame()
@@ -194,6 +233,9 @@ def get_stock_moneyflow(code: str, days: int = 20) -> pd.DataFrame:
         return cache_df
 
     pro = get_pro()
+    df = _query_with_retry(
+        pro.moneyflow, {"ts_code": code, "start_date": start, "end_date": latest}
+    )
     df = pro.moneyflow(ts_code=code, start_date=start, end_date=latest)
     if df.empty:
         return pd.DataFrame()
@@ -216,6 +258,8 @@ def get_stock_moneyflow(code: str, days: int = 20) -> pd.DataFrame:
         + df["sell_elg_amount"].fillna(0)
     )
 
+    turnover_safe = total_turnover.replace({0: pd.NA})
+    ratio = (df["main_net_in"] / turnover_safe) * 100
     with pd.option_context("mode.use_inf_as_na", True):
         ratio = df["main_net_in"] / total_turnover.replace({0: pd.NA}) * 100
     df["main_net_ratio"] = ratio.fillna(0)

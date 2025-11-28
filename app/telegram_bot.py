@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -14,11 +15,16 @@ def format_selection_for_telegram(df: pd.DataFrame, max_rows: int = 30) -> str:
         return "📭 今日没有符合严格条件的标的。"
 
     lines = []
-    lines.append("📈 今日量化选股结果（前 {} 只）".format(min(len(df), max_rows)))
-    lines.append("（条件：突破箱体+放量+主力 3 日净流入+主线板块+RS>0.7+得分>=80）")
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines.append("📈 今日量化选股结果")
+    lines.append("运行时间：{}".format(run_time))
+    lines.append(
+        "满足条件：突破箱体 + 放量 + 主力 3 日净流入 + 主线板块 + RS>0.7 + 得分>=80"
+    )
     lines.append("")
 
     show_df = df.head(max_rows)
+    lines.append(f"入选 {len(df)} 只，展示前 {len(show_df)} 只：")
     for _, row in show_df.iterrows():
         line = (
             f"{row['code']} {row['name']} | "
@@ -34,7 +40,45 @@ def format_selection_for_telegram(df: pd.DataFrame, max_rows: int = 30) -> str:
     return msg[:4000]
 
 
-def send_telegram_message(text: str) -> Optional[dict]:
+def build_help_message(schedule_time: str) -> str:
+    """生成 /help 的说明文案。"""
+
+    return "\n".join(
+        [
+            "🤖 机器人指令",
+            "",
+            "/run - 立即跑一次选股并推送结果",
+            "/status - 查看下一次定时任务以及上次选股时间",
+            "/last - 重发最近一次推送的结果",
+            "/help - 查看帮助",
+            "",
+            f"⏰ 每日定时：{schedule_time}",
+        ]
+    )
+
+
+def build_action_keyboard() -> dict:
+    """生成操作快捷按钮的 inline keyboard。"""
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "▶️ 立即运行", "callback_data": "run"},
+                {"text": "ℹ️ 状态", "callback_data": "status"},
+            ],
+            [
+                {"text": "📩 最近结果", "callback_data": "last"},
+                {"text": "❓ 帮助", "callback_data": "help"},
+            ],
+        ]
+    }
+
+
+def send_telegram_message(
+    text: str,
+    reply_markup: Optional[dict] = None,
+    disable_notification: bool = False,
+) -> Optional[dict]:
     """
     使用 Telegram Bot API 发送消息。
     """
@@ -47,7 +91,10 @@ def send_telegram_message(text: str) -> Optional[dict]:
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
+        "disable_notification": disable_notification,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     resp = requests.post(url, json=payload, timeout=15)
     if resp.status_code != 200:
@@ -55,3 +102,20 @@ def send_telegram_message(text: str) -> Optional[dict]:
         return None
 
     return resp.json()
+
+
+def extract_command_from_update(update: dict) -> Optional[str]:
+    """从 Telegram update 中提取命令。"""
+
+    message = update.get("message") or update.get("callback_query", {}).get("message")
+    if not message:
+        return None
+
+    if "text" in message:
+        text: str = message["text"]
+    elif "data" in update.get("callback_query", {}):
+        text = update["callback_query"]["data"]
+    else:
+        return None
+
+    return text.strip()

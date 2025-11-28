@@ -146,16 +146,23 @@ def get_stock_history(
 
 # =============== 每天更新的数据：实时快照（用来选前 MAX_STOCKS_PER_DAY） ===============
 
-def get_realtime_spot() -> pd.DataFrame:
+def get_top_liquidity_stocks(top_n=500):
     """
-    东方财富 A 股实时行情
-    接口: stock_zh_a_spot_em
+    获取全市场实时行情，并按成交额排序，选出前 top_n 只股票
+    这个接口稳定、速度快、不会被墙。
     """
     df = ak.stock_zh_a_spot_em()
-    # 列通常包括: "代码", "名称", "最新价", "涨跌幅", "成交额", ...
+
+    df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce")
+    df = df.dropna(subset=["成交额"])
+    df = df.sort_values("成交额", ascending=False).head(top_n)
+
+    # 统一字段格式
     df = df.rename(columns={"代码": "code", "名称": "name"})
     df["code"] = df["code"].astype(str)
-    return df
+
+    return df[["code", "name", "成交额"]]
+
 
 
 # =============== 每天更新的数据：个股资金流 ===============

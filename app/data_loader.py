@@ -1,154 +1,99 @@
 from .cache_manager import load_cache, save_cache
+# app/data_loader.py
+
 import os
 from datetime import datetime, timedelta
-from typing import Optional
 
 import pandas as pd
 import tushare as ts
 
-from .config import TUSHARE_TOKEN, BENCHMARK_INDEX
-
-# ================== 基础设置 ==================
-
-BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-_pro = None  # 全局 Tushare pro 实例
+TS_TOKEN = os.getenv("TS_TOKEN")
 
 
 def get_pro():
+    if not TS_TOKEN:
+        raise Exception("环境变量 TS_TOKEN 未设置")
+    ts.set_token(TS_TOKEN)
+    return ts.pro_api()
+
+
+# ========= 获取最近交易日 =========
+def get_latest_trade_date(days_back: int = 20) -> str:
     """
-    懒加载 Tushare pro 对象，只初始化一次。
-    """
-    global _pro
-    if _pro is None:
-        if not TUSHARE_TOKEN:
-            raise RuntimeError("TUSHARE_TOKEN 未设置，请在 Railway 环境变量里配置。")
-        ts.set_token(TUSHARE_TOKEN)
-        _pro = ts.pro_api()
-    return _pro
-
-
-def _csv_path(name: str) -> str:
-    return os.path.join(DATA_DIR, name)
-
-
-# ================== 交易日工具 ==================
-
-def get_latest_trade_date() -> str:
-    """
-    获取最近一个交易日（格式: YYYYMMDD）
+    返回最近一个交易日（YYYYMMDD）
     """
     pro = get_pro()
-    today = datetime.today().strftime("%Y%m%d")
-    start = (datetime.today() - timedelta(days=10)).strftime("%Y%m%d")
-    cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=today, is_open="1")
+    today = datetime.today()
+    start = (today - timedelta(days=days_back)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
+
+    cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=end, is_open="1")
     if cal.empty:
-        raise RuntimeError("无法获取交易日历")
-    return cal["cal_date"].iloc[-1]
+        raise Exception("trade_cal 返回为空，检查 Tushare 权限或网络")
+
+    last_trade_date = cal["cal_date"].iloc[-1]
+    return last_trade_date
 
 
-# ================== 股票基础信息 ==================
+# ========= 获取全市场股票基础信息（含行业） =========
+def get_stock_list() -> pd.DataFrame:
+    """
+    返回字段至少包含: code, name, industry, list_date
+    """
+    pro = get_pro()
 
-def get_stock_list():
-    cached = load_cache("stock_list.json")
-    if cached:
-        return pd.DataFrame(cached)
+    try:
+        df = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,name,area,industry,list_date",
+        )
+    except Exception as e:
+        print("[data_loader] stock_basic 调用失败，使用兜底字段", e)
+        df = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,name,list_date",
+        )
+        df["industry"] = "未知"
 
-    ... # 调用 Tushare
+    # 强制保证有 industry 列
+    if "industry" not in df.columns:
+        df["industry"] = "未知"
 
-    save_cache("stock_list.json", df.to_dict(orient="records"))
+    df.rename(columns={"ts_code": "code"}, inplace=True)
+    df["industry"] = df["industry"].fillna("未知")
+    df["name"] = df["name"].fillna("未知")
     return df
 
 
-
-
-# ================== 成交额前 N 名（EOD，用日线 amount 排序） ==================
-
-    cache_name = f"daily_{trade_date}.json"
-    cached = load_cache(cache_name)
-    if cached:
-        daily = pd.DataFrame(cached)
-    else:
-        daily = pro.daily(trade_date=trade_date)
-        save_cache(cache_name, daily.to_dict(orient="records"))
-
-
-
-# ================== 指数行情（用于 RS） ==================
-
-def get_index_history(days: int = 250) -> pd.DataFrame:
+# ========= 这里就是关键：get_top_liquidity_stocks =========
+def get_top_liquidity_stocks(top_n: int = 500) -> pd.DataFrame:
     """
-    获取基准指数最近 N 日行情，用于计算 RS。
+    获取按当日成交额排序的前 top_n 只股票
+    返回字段: code, name, industry, close, high, low, vol, amount
     """
     pro = get_pro()
-    end_date = get_latest_trade_date()
-    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days * 2)).strftime("%Y%m%d")
+    trade_date = get_latest_trade_date()
+    print(f"[data_loader] 获取 {trade_date} 全市场日线数据用于成交额排序")
 
-    df = pro.index_daily(ts_code=BENCHMARK_INDEX, start_date=start_date, end_date=end_date)
-    if df.empty:
-        raise RuntimeError("无法获取指数行情 index_daily")
+    daily = pro.daily(trade_date=trade_date)
+    if daily.empty:
+        raise Exception(f"Tushare daily({trade_date}) 返回为空")
 
-    df = df.sort_values("trade_date")
-    df = df.rename(
-        columns={
-            "trade_date": "date",
-        }
-    )
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    stock_list = get_stock_list()
 
+    # 按 ts_code / code merge
+    df = daily.merge(stock_list, left_on="ts_code", right_on="code", how="left")
 
-# ================== 个股日线 ==================
+    # 兜底
+    df["industry"] = df.get("industry", "未知")
+    df["industry"] = df["industry"].fillna("未知")
+    df["name"] = df["name"].fillna("未知")
 
-def get_stock_history(code: str, days: int = 300) -> pd.DataFrame:
-    """
-    获取单只股票最近 N 日日线数据。
-    code 为 ts_code，例如 '000001.SZ'
-    """
-    pro = get_pro()
-    end_date = get_latest_trade_date()
-    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days * 2)).strftime("%Y%m%d")
+    # 成交额 amount 转成数值 & 排序
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df = df.dropna(subset=["amount"])
+    df = df.sort_values("amount", ascending=False).head(top_n)
 
-    df = pro.daily(ts_code=code, start_date=start_date, end_date=end_date)
-    if df.empty:
-        return pd.DataFrame()
-
-    df = df.sort_values("trade_date")
-    df = df.rename(
-        columns={
-            "trade_date": "date",
-            "vol": "volume",
-        }
-    )
-    df["date"] = pd.to_datetime(df["date"])
-    return df[["date", "open", "high", "low", "close", "volume", "amount"]]
-
-
-# ================== 个股资金流 ==================
-
-def get_stock_moneyflow(code: str, days: int = 20) -> pd.DataFrame:
-    """
-    获取单只股票最近 N 日资金流数据（moneyflow）。
-    """
-    pro = get_pro()
-    end_date = get_latest_trade_date()
-    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days * 2)).strftime("%Y%m%d")
-
-    df = pro.moneyflow(ts_code=code, start_date=start_date, end_date=end_date)
-    if df.empty:
-        return pd.DataFrame()
-
-    df = df.sort_values("trade_date")
-    df = df.rename(columns={"trade_date": "date"})
-    df["date"] = pd.to_datetime(df["date"])
-
-    # 资金流：使用 net_mf_amount 作为“主力净流入金额”
-    # 资金流占比：用 net_mf_amount / amount 粗略近似（金额比重）
-    df["main_net_in"] = df["net_mf_amount"]
-    # 避免除零错误
-    df["main_net_ratio"] = df["net_mf_amount"] / (df["amount"].replace(0, pd.NA)) * 100
-    df["main_net_ratio"] = df["main_net_ratio"].fillna(0)
-
-    return df[["date", "main_net_in", "main_net_ratio"]]
+    return df[["code", "name", "industry", "close", "high", "low", "vol", "amount"]]

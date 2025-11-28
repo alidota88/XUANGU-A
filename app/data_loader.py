@@ -29,7 +29,12 @@ def get_stock_list(force_update: bool = False) -> pd.DataFrame:
         df = pd.read_csv(path, dtype={"code": str})
         return df
 
-    df = ak.stock_info_a_code_name()  # 接口: stock_info_a_code_name
+def get_stock_list(force_update=False):
+    path = _csv_path("stock_list.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError("请上传 full-market stock_list.csv 到 app/data/")
+    return pd.read_csv(path, dtype={"code": str})
+    
     # 统一字段
     df = df.rename(columns={"code": "code", "name": "name"})
     df["code"] = df["code"].astype(str)

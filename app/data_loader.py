@@ -1,183 +1,208 @@
 import os
 from datetime import datetime, timedelta
 
-import akshare as ak
 import pandas as pd
+import tushare as ts
 
-from .config import BENCHMARK_INDEX
+from .config import TUSHARE_TOKEN, BENCHMARK_INDEX, INDEX_UNIVERSE
 
-# 缓存目录：app/data
+# =============== 初始化 Tushare ===============
+if not TUSHARE_TOKEN:
+    raise RuntimeError("TUSHARE_TOKEN 未设置，请在 Railway 环境变量中配置。")
+
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
+
+# =============== 缓存目录 ===============
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# =============== 工具函数 ===============
-
 def _csv_path(name: str) -> str:
     return os.path.join(DATA_DIR, name)
 
 
-# =============== 可复用静态数据：股票列表 ===============
+# =============== 交易日工具 ===============
 
-def get_stock_list(force_update: bool = False) -> pd.DataFrame:
+def get_last_trade_date() -> str:
     """
-    获取 A 股列表，并缓存到 data/stock_list.csv
+    获取最近一个交易日（上交所）YYYYMMDD 字符串
     """
-    path = _csv_path("stock_list.csv")
+    today = datetime.today()
+    start = (today - timedelta(days=10)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
+    cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=end, is_open="1")
+    last = cal["cal_date"].max()
+    return str(last)
+
+
+# =============== 股票基础信息 ===============
+
+def get_stock_basic(force_update: bool = False) -> pd.DataFrame:
+    """
+    获取全市场股票基础信息，并缓存到 data/stock_basic.csv
+    字段：ts_code, symbol, name, area, industry, market, list_date
+    """
+    path = _csv_path("stock_basic.csv")
     if not force_update and os.path.exists(path):
-        df = pd.read_csv(path, dtype={"code": str})
-        return df
+        return pd.read_csv(path, dtype={"ts_code": str, "symbol": str})
 
-    df = ak.stock_info_a_code_name()  # 接口: stock_info_a_code_name
-    # 统一字段
-    df = df.rename(columns={"code": "code", "name": "name"})
-    df["code"] = df["code"].astype(str)
+    df = pro.stock_basic(
+        exchange="",
+        list_status="L",
+        fields="ts_code,symbol,name,area,industry,market,list_date",
+    )
     df.to_csv(path, index=False, encoding="utf-8-sig")
     return df
 
 
-# =============== 可复用静态数据：行业成分 ===============
+# =============== 指数成分股（选股宇宙） ===============
 
-def get_industry_mapping(force_update: bool = False) -> pd.DataFrame:
+def get_index_universe(force_update: bool = False) -> pd.DataFrame:
     """
-    使用东方财富行业板块：
-    - ak.stock_board_industry_name_em() 获取所有行业
-    - ak.stock_board_industry_cons_em(symbol=行业名) 获取成份股
-    结果缓存到 data/industry_map.csv
+    获取指数成分股列表，例如沪深300：INDEX_UNIVERSE = "000300.SH"
+    返回列：code(=ts_code), name, industry
     """
-    path = _csv_path("industry_map.csv")
+    path = _csv_path(f"universe_{INDEX_UNIVERSE.replace('.', '')}.csv")
     if not force_update and os.path.exists(path):
         return pd.read_csv(path, dtype={"code": str})
 
-    # 行业列表
-    industry_df = ak.stock_board_industry_name_em()  # 板块名称、板块代码等
-    rows = []
-    for _, row in industry_df.iterrows():
-        industry_name = row["板块名称"]
-        try:
-            cons_df = ak.stock_board_industry_cons_em(symbol=industry_name)
-        except Exception as e:
-            print(f"[industry] 获取板块成份失败: {industry_name} - {e}")
-            continue
-
-        for _, c in cons_df.iterrows():
-            code = str(c["代码"])
-            rows.append({"code": code, "industry": industry_name})
-
-    map_df = pd.DataFrame(rows).drop_duplicates(subset=["code"])
-    map_df.to_csv(path, index=False, encoding="utf-8-sig")
-    return map_df
-
-
-# =============== 每天更新的数据：板块资金流（行业维度） ===============
-
-def get_sector_fund_flow_rank() -> pd.DataFrame:
-    """
-    板块资金流排名（行业资金流，5日）
-    接口: stock_sector_fund_flow_rank(indicator="5日", sector_type="行业资金流")
-    """
-    df = ak.stock_sector_fund_flow_rank(
-        indicator="5日",
-        sector_type="行业资金流"
+    last_trade = get_last_trade_date()
+    weight_df = pro.index_weight(
+        index_code=INDEX_UNIVERSE,
+        trade_date=last_trade,
     )
-    # 统一一下列名，方便后面用
-    # 一般会有: "板块名称", "主力净流入-净额", "涨跌幅", "主力净流入-净占比" 等
-    return df
+    # weight_df: index_code, con_code, trade_date, weight
+    basic_df = get_stock_basic()
+    merged = weight_df.merge(
+        basic_df,
+        left_on="con_code",
+        right_on="ts_code",
+        how="left",
+    )
+
+    merged["code"] = merged["ts_code"]
+    universe = merged[["code", "name", "industry"]].dropna(subset=["code"])
+
+    universe.to_csv(path, index=False, encoding="utf-8-sig")
+    return universe
 
 
-# =============== 每天更新的数据：指数历史行情 ===============
+# =============== 指数历史行情 ===============
 
-def get_index_history(days: int = 250) -> pd.DataFrame:
+def get_index_history(days: int = 300) -> pd.DataFrame:
     """
-    获取沪深 300 等指数最近 N 天，用于计算 RS
-    接口: stock_zh_index_daily
+    指数日线历史，用于计算 RS
     """
-    df = ak.stock_zh_index_daily(symbol=BENCHMARK_INDEX)
-    df = df.tail(days).reset_index(drop=True)
-    # 列一般为: date, open, close, high, low, volume, amount
-    return df
+    end = datetime.today()
+    start = (end - timedelta(days=days * 2)).strftime("%Y%m%d")
+
+    df = pro.index_daily(
+        ts_code=BENCHMARK_INDEX,
+        start_date=start,
+        end_date=end.strftime("%Y%m%d"),
+    )
+    if df.empty:
+        return df
+
+    # Tushare 默认按日期从近到远，需要反转一下
+    df = df.sort_values("trade_date")
+    df = df.tail(days)
+
+    df = df.rename(
+        columns={
+            "trade_date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "vol": "volume",
+            "amount": "amount",
+        }
+    )
+    df["date"] = pd.to_datetime(df["date"])
+    return df.reset_index(drop=True)
 
 
-# =============== 每天更新的数据：个股行情 ===============
+# =============== 个股历史行情 ===============
 
 def get_stock_history(
-    code: str,
+    ts_code: str,
     start_date: str | None = None,
-    adjust: str = "qfq"
 ) -> pd.DataFrame:
     """
-    获取单只股票历史行情（日线）
-    接口: stock_zh_a_hist
+    获取单只股票历史日线
     """
     if start_date is None:
-        # 默认取最近 400 天
         start_date = (datetime.today() - timedelta(days=400)).strftime("%Y%m%d")
+    end_date = datetime.today().strftime("%Y%m%d")
 
-    df = ak.stock_zh_a_hist(
-        symbol=code,
-        period="daily",
+    df = pro.daily(
+        ts_code=ts_code,
         start_date=start_date,
-        end_date=datetime.today().strftime("%Y%m%d"),
-        adjust=adjust,
+        end_date=end_date,
     )
+    if df.empty:
+        return df
 
-    # 中文列名转成英文，方便后面统一处理
+    df = df.sort_values("trade_date")
+
     df = df.rename(
         columns={
-            "日期": "date",
-            "开盘": "open",
-            "收盘": "close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "volume",
-            "成交额": "amount",
-            "涨跌幅": "pct_chg",
+            "trade_date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "vol": "volume",
+            "amount": "amount",
         }
     )
     df["date"] = pd.to_datetime(df["date"])
-    return df
+    return df.reset_index(drop=True)
 
 
-# =============== 每天更新的数据：实时快照（用来选前 MAX_STOCKS_PER_DAY） ===============
+# =============== 个股资金流（主力净流入） ===============
 
-def get_realtime_spot() -> pd.DataFrame:
+def get_stock_moneyflow(ts_code: str, days: int = 60) -> pd.DataFrame:
     """
-    东方财富 A 股实时行情
-    接口: stock_zh_a_spot_em
+    Tushare moneyflow:
+      ts_code, trade_date, buy_sm_vol, ..., net_mf_vol, net_mf_amount, net_mf_ratio, ...
+    我们用：
+      main_net_in   := net_mf_amount
+      main_net_ratio := net_mf_ratio
     """
-    df = ak.stock_zh_a_spot_em()
-    # 列通常包括: "代码", "名称", "最新价", "涨跌幅", "成交额", ...
-    df = df.rename(columns={"代码": "code", "名称": "name"})
-    df["code"] = df["code"].astype(str)
-    return df
+    end = datetime.today()
+    start = (end - timedelta(days=days * 2)).strftime("%Y%m%d")
 
-
-# =============== 每天更新的数据：个股资金流 ===============
-
-def _code_to_market(code: str) -> str:
-    """
-    简单规则：
-    - 6xxxxxx -> 上交所 sh
-    - 其他 -> 深交所 sz
-    """
-    return "sh" if code.startswith("6") else "sz"
-
-
-def get_stock_fund_flow(code: str) -> pd.DataFrame:
-    """
-    获取个股资金流，近 100 个交易日
-    接口: stock_individual_fund_flow(stock="000651", market="sz")
-    """
-    market = _code_to_market(code)
-    df = ak.stock_individual_fund_flow(stock=code, market=market)
-    # 列一般包括: 日期, 主力净流入-净额, 主力净流入-净占比, 收盘价, 涨跌幅 等
-    df = df.rename(
-        columns={
-            "日期": "date",
-            "主力净流入-净额": "main_net_in",
-            "主力净流入-净占比": "main_net_ratio",
-        }
+    df = pro.moneyflow(
+        ts_code=ts_code,
+        start_date=start,
+        end_date=end.strftime("%Y%m%d"),
     )
+    if df.empty:
+        return df
+
+    df = df.sort_values("trade_date")
+    df = df.tail(days)
+
+    # 有的字段名字可能不同，这里做一次兼容
+    if "net_mf_amount" in df.columns:
+        main_in = df["net_mf_amount"]
+    else:
+        # 兜底：如果没有 net_mf_amount，就用 0
+        main_in = 0
+
+    if "net_mf_ratio" in df.columns:
+        main_ratio = df["net_mf_ratio"]
+    else:
+        main_ratio = 0
+
+    df = df.assign(
+        main_net_in=main_in,
+        main_net_ratio=main_ratio,
+    )
+    df = df.rename(columns={"trade_date": "date"})
     df["date"] = pd.to_datetime(df["date"])
-    return df
+    return df.reset_index(drop=True)

@@ -107,6 +107,12 @@ def _scheduler_worker():
     print(f"[scheduler] Running everyday at {SCHEDULE_TIME}")
     last_run_date = None
 
+    import asyncio
+
+async def scheduler_task():
+    print(f"[scheduler] running daily at {SCHEDULE_TIME}")
+    last_run_date = None
+
     while True:
         now = datetime.now()
         cur = now.strftime("%H:%M")
@@ -117,7 +123,12 @@ def _scheduler_worker():
             send_telegram_message(format_selection_for_telegram(df))
             last_run_date = today
 
-        time.sleep(60)
+        await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def start_scheduler():
+    asyncio.create_task(scheduler_task())
+
 
 
 @app.on_event("startup")

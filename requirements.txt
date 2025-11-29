@@ -1,6 +1,5 @@
-fastapi
-uvicorn[standard]
-requests
 tushare
 pandas
 numpy
+python-telegram-bot==20.4
+pytz

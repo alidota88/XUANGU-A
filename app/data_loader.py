@@ -1,268 +1,183 @@
-from .cache_manager import load_cache, save_cache
-# app/data_loader.py
-
 import os
-import time
 from datetime import datetime, timedelta
 
+import akshare as ak
 import pandas as pd
-import tushare as ts
 
-from .config import BENCHMARK_INDEX, TUSHARE_TOKEN
+from .config import BENCHMARK_INDEX
 
-# 兼容旧变量名
-TS_TOKEN = TUSHARE_TOKEN or os.getenv("TS_TOKEN", "")
-
-
-def get_pro():
-    if not TS_TOKEN:
-        raise Exception("环境变量 TUSHARE_TOKEN 未设置")
-    ts.set_token(TS_TOKEN)
-    return ts.pro_api()
+# 缓存目录：app/data
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def _query_with_retry(api_func, kwargs: dict, retries: int = 3, delay: float = 1.0):
+# =============== 工具函数 ===============
+
+def _csv_path(name: str) -> str:
+    return os.path.join(DATA_DIR, name)
+
+
+# =============== 可复用静态数据：股票列表 ===============
+
+def get_stock_list(force_update: bool = False) -> pd.DataFrame:
     """
-    统一的 Tushare 调用重试逻辑，处理偶发的断开/超时。
-
-    说明：合并主干时保留了此前 PR 引入的重试行为，避免未来冲突时
-    不小心退回到无重试的旧实现。
+    获取 A 股列表，并缓存到 data/stock_list.csv
     """
+    path = _csv_path("stock_list.csv")
+    if not force_update and os.path.exists(path):
+        df = pd.read_csv(path, dtype={"code": str})
+        return df
 
-    last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            return api_func(**kwargs)
-        except Exception as e:  # noqa: PERF203 - 外部依赖调用需要兜底
-            last_err = e
-            if attempt == retries:
-                break
-            print(
-                f"[data_loader] {getattr(api_func, '__name__', str(api_func))} 失败"
-                f"(第 {attempt}/{retries} 次)：{e}，重试中..."
-            )
-            time.sleep(delay)
-
-    raise last_err  # type: ignore[misc]
-
-
-def _load_cached_df(name: str) -> pd.DataFrame | None:
-    data = load_cache(name)
-    if not data:
-        return None
-    if isinstance(data, dict) and "data" in data:
-        data = data.get("data")
-    if not data:
-        return None
-    return pd.DataFrame(data)
-
-
-def _save_cached_df(name: str, df: pd.DataFrame):
-    if df is None or df.empty:
-        return
-    save_cache(name, df.to_dict(orient="records"))
-
-
-# ========= 获取最近交易日 =========
-def get_latest_trade_date(days_back: int = 20) -> str:
-    """
-    返回最近一个交易日（YYYYMMDD）
-    """
-    pro = get_pro()
-    today = datetime.today()
-    start = (today - timedelta(days=days_back)).strftime("%Y%m%d")
-    end = today.strftime("%Y%m%d")
-
-    cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=end, is_open="1")
-    if cal.empty:
-        raise Exception("trade_cal 返回为空，检查 Tushare 权限或网络")
-
-    last_trade_date = cal["cal_date"].iloc[-1]
-    return last_trade_date
-
-
-# ========= 获取全市场股票基础信息（含行业） =========
-def get_stock_list() -> pd.DataFrame:
-    """
-    返回字段至少包含: code, name, industry, list_date
-    """
-    pro = get_pro()
-    today = datetime.today().strftime("%Y%m%d")
-
-    cache = load_cache("stock_list.json")
-    if isinstance(cache, dict) and cache.get("date") == today:
-        cached_data = cache.get("data", [])
-        if cached_data:
-            return pd.DataFrame(cached_data)
-
-    try:
-        df = _query_with_retry(
-            pro.stock_basic,
-            {
-                "exchange": "",
-                "list_status": "L",
-                "fields": "ts_code,name,area,industry,list_date",
-            },
-        )
-    except Exception as e:
-        print("[data_loader] stock_basic 调用失败，使用兜底字段", e)
-        df = _query_with_retry(
-            pro.stock_basic,
-            {
-                "exchange": "",
-                "list_status": "L",
-                "fields": "ts_code,name,list_date",
-            },
-        )
-        df["industry"] = "未知"
-
-    # 强制保证有 industry 列
-    if "industry" not in df.columns:
-        df["industry"] = "未知"
-
-    df.rename(columns={"ts_code": "code"}, inplace=True)
-    df["industry"] = df["industry"].fillna("未知")
-    df["name"] = df["name"].fillna("未知")
-
-    save_cache("stock_list.json", {"date": today, "data": df.to_dict(orient="records")})
+    df = ak.stock_info_a_code_name()  # 接口: stock_info_a_code_name
+    # 统一字段
+    df = df.rename(columns={"code": "code", "name": "name"})
+    df["code"] = df["code"].astype(str)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
     return df
 
 
-# ========= 这里就是关键：get_top_liquidity_stocks =========
-def get_top_liquidity_stocks(top_n: int = 500) -> pd.DataFrame:
+# =============== 可复用静态数据：行业成分 ===============
+
+def get_industry_mapping(force_update: bool = False) -> pd.DataFrame:
     """
-    获取按当日成交额排序的前 top_n 只股票
-    返回字段: code, name, industry, close, high, low, vol, amount
+    使用东方财富行业板块：
+    - ak.stock_board_industry_name_em() 获取所有行业
+    - ak.stock_board_industry_cons_em(symbol=行业名) 获取成份股
+    结果缓存到 data/industry_map.csv
     """
-    pro = get_pro()
-    trade_date = get_latest_trade_date()
-    print(f"[data_loader] 获取 {trade_date} 全市场日线数据用于成交额排序")
+    path = _csv_path("industry_map.csv")
+    if not force_update and os.path.exists(path):
+        return pd.read_csv(path, dtype={"code": str})
 
-    daily = _query_with_retry(pro.daily, {"trade_date": trade_date})
-    if daily.empty:
-        raise Exception(f"Tushare daily({trade_date}) 返回为空")
+    # 行业列表
+    industry_df = ak.stock_board_industry_name_em()  # 板块名称、板块代码等
+    rows = []
+    for _, row in industry_df.iterrows():
+        industry_name = row["板块名称"]
+        try:
+            cons_df = ak.stock_board_industry_cons_em(symbol=industry_name)
+        except Exception as e:
+            print(f"[industry] 获取板块成份失败: {industry_name} - {e}")
+            continue
 
-    stock_list = get_stock_list()
+        for _, c in cons_df.iterrows():
+            code = str(c["代码"])
+            rows.append({"code": code, "industry": industry_name})
 
-    # 按 ts_code / code merge
-    df = daily.merge(stock_list, left_on="ts_code", right_on="code", how="left")
-
-    # 兜底
-    df["industry"] = df.get("industry", "未知")
-    df["industry"] = df["industry"].fillna("未知")
-    df["name"] = df["name"].fillna("未知")
-
-    # 成交额 amount 转成数值 & 排序
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    df = df.dropna(subset=["amount"])
-    df = df.sort_values("amount", ascending=False).head(top_n)
-
-    return df[["code", "name", "industry", "close", "high", "low", "vol", "amount"]]
+    map_df = pd.DataFrame(rows).drop_duplicates(subset=["code"])
+    map_df.to_csv(path, index=False, encoding="utf-8-sig")
+    return map_df
 
 
-def _get_start_date(days: int) -> str:
-    return (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
+# =============== 每天更新的数据：板块资金流（行业维度） ===============
 
-
-def get_index_history(code: str | None = None, days: int = 250) -> pd.DataFrame:
+def get_sector_fund_flow_rank() -> pd.DataFrame:
     """
-    获取指数历史行情，用于 RS 计算
-    返回字段至少包含: date, close, high, low, volume
+    板块资金流排名（行业资金流，5日）
+    接口: stock_sector_fund_flow_rank(indicator="5日", sector_type="行业资金流")
     """
-    if code is None:
-        code = BENCHMARK_INDEX
-
-    latest = get_latest_trade_date()
-    start = _get_start_date(days)
-    cache_name = f"index_{code}_{start}_{latest}.json"
-    cache_df = _load_cached_df(cache_name)
-    if cache_df is not None and not cache_df.empty:
-        return cache_df
-
-    pro = get_pro()
-    df = _query_with_retry(
-        pro.index_daily,
-        {"ts_code": code, "start_date": start, "end_date": latest},
+    df = ak.stock_sector_fund_flow_rank(
+        indicator="5日",
+        sector_type="行业资金流"
     )
-    if df.empty:
-        raise Exception(f"index_daily({code}) 返回为空")
-
-    df = df.sort_values("trade_date")
-    df.rename(columns={"trade_date": "date", "vol": "volume"}, inplace=True)
-    _save_cached_df(cache_name, df)
-    return df[["date", "close", "high", "low", "volume"]]
+    # 统一一下列名，方便后面用
+    # 一般会有: "板块名称", "主力净流入-净额", "涨跌幅", "主力净流入-净占比" 等
+    return df
 
 
-def get_stock_history(code: str, days: int = 300) -> pd.DataFrame:
+# =============== 每天更新的数据：指数历史行情 ===============
+
+def get_index_history(days: int = 250) -> pd.DataFrame:
     """
-    获取个股日线行情
-    返回字段至少包含: date, close, high, low, volume
+    获取沪深 300 等指数最近 N 天，用于计算 RS
+    接口: stock_zh_index_daily
     """
-    latest = get_latest_trade_date()
-    start = _get_start_date(days)
-    cache_name = f"price_{code}_{start}_{latest}.json"
-    cache_df = _load_cached_df(cache_name)
-    if cache_df is not None and not cache_df.empty:
-        return cache_df
-
-    pro = get_pro()
-    df = _query_with_retry(
-        pro.daily, {"ts_code": code, "start_date": start, "end_date": latest}
-    )
-    if df.empty:
-        return pd.DataFrame()
-
-    df = df.sort_values("trade_date")
-    df.rename(columns={"trade_date": "date", "vol": "volume"}, inplace=True)
-    _save_cached_df(cache_name, df)
-    return df[["date", "close", "high", "low", "volume"]]
+    df = ak.stock_zh_index_daily(symbol=BENCHMARK_INDEX)
+    df = df.tail(days).reset_index(drop=True)
+    # 列一般为: date, open, close, high, low, volume, amount
+    return df
 
 
-def get_stock_moneyflow(code: str, days: int = 20) -> pd.DataFrame:
+# =============== 每天更新的数据：个股行情 ===============
+
+def get_stock_history(
+    code: str,
+    start_date: str | None = None,
+    adjust: str = "qfq"
+) -> pd.DataFrame:
     """
-    获取个股资金流，计算主力净流入及占比
-    返回字段至少包含: date, main_net_in, main_net_ratio
+    获取单只股票历史行情（日线）
+    接口: stock_zh_a_hist
     """
-    latest = get_latest_trade_date()
-    start = _get_start_date(days)
-    cache_name = f"money_{code}_{start}_{latest}.json"
-    cache_df = _load_cached_df(cache_name)
-    if cache_df is not None and not cache_df.empty:
-        return cache_df
+    if start_date is None:
+        # 默认取最近 400 天
+        start_date = (datetime.today() - timedelta(days=400)).strftime("%Y%m%d")
 
-    pro = get_pro()
-    df = _query_with_retry(
-        pro.moneyflow, {"ts_code": code, "start_date": start, "end_date": latest}
-    )
-    if df.empty:
-        return pd.DataFrame()
-
-    df["main_net_in"] = (
-        df["buy_elg_amount"].fillna(0)
-        + df["buy_lg_amount"].fillna(0)
-        - df["sell_elg_amount"].fillna(0)
-        - df["sell_lg_amount"].fillna(0)
+    df = ak.stock_zh_a_hist(
+        symbol=code,
+        period="daily",
+        start_date=start_date,
+        end_date=datetime.today().strftime("%Y%m%d"),
+        adjust=adjust,
     )
 
-    total_turnover = (
-        df["buy_sm_amount"].fillna(0)
-        + df["sell_sm_amount"].fillna(0)
-        + df["buy_md_amount"].fillna(0)
-        + df["sell_md_amount"].fillna(0)
-        + df["buy_lg_amount"].fillna(0)
-        + df["sell_lg_amount"].fillna(0)
-        + df["buy_elg_amount"].fillna(0)
-        + df["sell_elg_amount"].fillna(0)
+    # 中文列名转成英文，方便后面统一处理
+    df = df.rename(
+        columns={
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "涨跌幅": "pct_chg",
+        }
     )
+    df["date"] = pd.to_datetime(df["date"])
+    return df
 
-    turnover_safe = total_turnover.replace({0: pd.NA})
-    ratio = (df["main_net_in"] / turnover_safe) * 100
-    with pd.option_context("mode.use_inf_as_na", True):
-        ratio = df["main_net_in"] / total_turnover.replace({0: pd.NA}) * 100
-    df["main_net_ratio"] = ratio.fillna(0)
 
-    df = df.sort_values("trade_date")
-    df.rename(columns={"trade_date": "date"}, inplace=True)
-    df_res = df[["date", "main_net_in", "main_net_ratio"]].copy()
-    _save_cached_df(cache_name, df_res)
-    return df_res
+# =============== 每天更新的数据：实时快照（用来选前 MAX_STOCKS_PER_DAY） ===============
+
+def get_realtime_spot() -> pd.DataFrame:
+    """
+    东方财富 A 股实时行情
+    接口: stock_zh_a_spot_em
+    """
+    df = ak.stock_zh_a_spot_em()
+    # 列通常包括: "代码", "名称", "最新价", "涨跌幅", "成交额", ...
+    df = df.rename(columns={"代码": "code", "名称": "name"})
+    df["code"] = df["code"].astype(str)
+    return df
+
+
+# =============== 每天更新的数据：个股资金流 ===============
+
+def _code_to_market(code: str) -> str:
+    """
+    简单规则：
+    - 6xxxxxx -> 上交所 sh
+    - 其他 -> 深交所 sz
+    """
+    return "sh" if code.startswith("6") else "sz"
+
+
+def get_stock_fund_flow(code: str) -> pd.DataFrame:
+    """
+    获取个股资金流，近 100 个交易日
+    接口: stock_individual_fund_flow(stock="000651", market="sz")
+    """
+    market = _code_to_market(code)
+    df = ak.stock_individual_fund_flow(stock=code, market=market)
+    # 列一般包括: 日期, 主力净流入-净额, 主力净流入-净占比, 收盘价, 涨跌幅 等
+    df = df.rename(
+        columns={
+            "日期": "date",
+            "主力净流入-净额": "main_net_in",
+            "主力净流入-净占比": "main_net_ratio",
+        }
+    )
+    df["date"] = pd.to_datetime(df["date"])
+    return df

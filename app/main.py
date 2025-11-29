@@ -89,7 +89,7 @@ async def telegram_webhook(request: Request):
     command = command_raw.lower()
     keyboard = build_action_keyboard()
 
-    if command in ("/start", "/help", "help"):
+    if command in ("/start", "/help", "help", "/commands", "commands", "菜单", "帮助"):
         send_telegram_message(
             build_help_message(SCHEDULE_TIME),
             reply_markup=keyboard,

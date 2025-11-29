@@ -40,21 +40,33 @@ def format_selection_for_telegram(df: pd.DataFrame, max_rows: int = 30) -> str:
     return msg[:4000]
 
 
+_COMMANDS = [
+    ("/run", "立即跑一次选股并推送结果"),
+    ("/status", "查看下一次定时任务以及上次选股时间"),
+    ("/last", "重发最近一次推送的结果"),
+    ("/help", "查看帮助信息"),
+    ("/commands", "查看全部支持的命令"),
+]
+
+
 def build_help_message(schedule_time: str) -> str:
     """生成 /help 的说明文案。"""
 
-    return "\n".join(
+    lines = ["🤖 机器人指令", ""]
+
+    for command, description in _COMMANDS:
+        lines.append(f"{command} - {description}")
+
+    lines.extend(
         [
-            "🤖 机器人指令",
             "",
-            "/run - 立即跑一次选股并推送结果",
-            "/status - 查看下一次定时任务以及上次选股时间",
-            "/last - 重发最近一次推送的结果",
-            "/help - 查看帮助",
+            "ℹ️ 也可以直接点击下方的快捷按钮操作。",
             "",
             f"⏰ 每日定时：{schedule_time}",
         ]
     )
+
+    return "\n".join(lines)
 
 
 def build_action_keyboard() -> dict:
@@ -69,6 +81,9 @@ def build_action_keyboard() -> dict:
             [
                 {"text": "📩 最近结果", "callback_data": "last"},
                 {"text": "❓ 帮助", "callback_data": "help"},
+            ],
+            [
+                {"text": "📜 命令一览", "callback_data": "commands"},
             ],
         ]
     }
@@ -105,14 +120,18 @@ def send_telegram_message(
 
 
 def extract_command_from_update(update: dict) -> Optional[str]:
-    """从 Telegram update 中提取命令。"""
+    """从 Telegram update 中提取命令，兼容 /help@bot 这样的格式。"""
 
     message = update.get("message") or update.get("callback_query", {}).get("message")
     if not message:
         return None
 
     if "text" in message:
-        text: str = message["text"]
+        raw_text: str = message["text"]
+        text = raw_text.strip().split()[0]  # 只取第一个词，忽略参数
+        if text.startswith("/"):
+            # 处理 /help@my_bot 这类指令
+            text = "/" + text[1:].split("@", maxsplit=1)[0]
     elif "data" in update.get("callback_query", {}):
         text = update["callback_query"]["data"]
     else:

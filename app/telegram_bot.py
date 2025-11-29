@@ -1,58 +1,51 @@
-from typing import Optional
+import aiohttp
+import asyncio
+import os
 
-import pandas as pd
-import requests
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-
-def format_selection_for_telegram(df: pd.DataFrame, max_rows: int = 30) -> str:
+async def async_send_message(text: str):
     """
-    把选股结果格式成 Telegram 文本消息
+    完全异步的发送 Telegram 消息版本
+    不阻塞，不会把服务器拖死
+    自动重试 3 次
     """
-    if df is None or df.empty:
-        return "📭 今日没有符合严格条件的标的。"
 
-    lines = []
-    lines.append(f"📈 今日量化选股结果（显示前 {min(len(df), max_rows)} 只）")
-    lines.append("条件：突破箱体 + 放量 + 主力净流入 + 主线行业 + RS>0.7 + 得分>=80")
-    lines.append("")
-
-    show_df = df.head(max_rows)
-
-    for _, row in show_df.iterrows():
-        line = (
-            f"{row['code']} {row['name']} | "
-            f"行业: {row['industry']} | "
-            f"RS: {row['RS']:.2f} | "
-            f"板块涨幅Rank: {row['sector_up_rank']:.2f} | "
-            f"板块资金Rank: {row['sector_flow_rank']:.2f} | "
-            f"总分: {row['score']:.1f}"
-        )
-        lines.append(line)
-
-    msg = "\n".join(lines)
-    return msg[:4000]  # 防止超出 Telegram 单条长度限制
-
-
-def send_telegram_message(text: str) -> Optional[dict]:
-    """
-    通过 Telegram Bot API 发送消息
-    """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram] TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，跳过发送")
-        return None
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
+        "parse_mode": "HTML"
     }
 
-    resp = requests.post(url, json=payload, timeout=15)
-    if resp.status_code != 200:
-        print("[telegram] 发送失败:", resp.text)
-        return None
+    for attempt in range(3):
+        try:
+            timeout = aiohttp.ClientTimeout(total=3)   # 限制最多 3 秒
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(API_URL, json=payload) as resp:
+                    if resp.status == 200:
+                        return True
+                    else:
+                        print(f"[telegram] error status {resp.status}")
+        except Exception as e:
+            print(f"[telegram] send error: {e}")
 
-    return resp.json()
+        await asyncio.sleep(0.5)
+
+    return False
+
+
+def send_telegram_message(text: str):
+    """
+    对外仍然保持同步接口
+    但内部用 asyncio 创建异步任务
+    避免阻塞 uvicorn
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(async_send_message(text))
+    except RuntimeError:
+        # 在没有 event loop 情况下的新 loop
+        asyncio.run(async_send_message(text))

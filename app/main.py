@@ -10,6 +10,7 @@ from .selector import run_selection
 from .telegram_bot import (
     build_action_keyboard,
     build_help_message,
+    extract_chat_id,
     extract_command_from_update,
     format_selection_for_telegram,
     send_telegram_message,
@@ -82,6 +83,7 @@ async def telegram_webhook(request: Request):
 
     update = await request.json()
     command_raw = extract_command_from_update(update)
+    chat_id = extract_chat_id(update)
 
     if not command_raw:
         return {"status": "ignored", "reason": "no command"}
@@ -94,6 +96,7 @@ async def telegram_webhook(request: Request):
             build_help_message(SCHEDULE_TIME),
             reply_markup=keyboard,
             disable_notification=True,
+            chat_id=chat_id,
         )
         return {"status": "ok", "action": "help"}
 
@@ -102,6 +105,7 @@ async def telegram_webhook(request: Request):
             _format_status_message(),
             reply_markup=keyboard,
             disable_notification=True,
+            chat_id=chat_id,
         )
         return {"status": "ok", "action": "status"}
 
@@ -110,10 +114,14 @@ async def telegram_webhook(request: Request):
             last_text = _last_selection_text
 
         if last_text:
-            send_telegram_message(last_text, reply_markup=keyboard, disable_notification=True)
+            send_telegram_message(
+                last_text, reply_markup=keyboard, disable_notification=True, chat_id=chat_id
+            )
             return {"status": "ok", "action": "last"}
 
-        send_telegram_message("暂无历史推送记录。", reply_markup=keyboard, disable_notification=True)
+        send_telegram_message(
+            "暂无历史推送记录。", reply_markup=keyboard, disable_notification=True, chat_id=chat_id
+        )
         return {"status": "ok", "action": "last_empty"}
 
     if command in ("/run", "run"):
@@ -121,13 +129,14 @@ async def telegram_webhook(request: Request):
         text = format_selection_for_telegram(df)
         count = 0 if df is None else int(len(df))
         _remember_selection_result(text, count)
-        send_telegram_message(text, reply_markup=keyboard)
+        send_telegram_message(text, reply_markup=keyboard, chat_id=chat_id)
         return {"status": "ok", "action": "run", "selected_count": count}
 
     send_telegram_message(
         "未识别的指令，发送 /help 查看可用操作。",
         reply_markup=keyboard,
         disable_notification=True,
+        chat_id=chat_id,
     )
     return {"status": "ignored", "action": "unknown"}
 

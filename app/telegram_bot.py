@@ -89,21 +89,35 @@ def build_action_keyboard() -> dict:
     }
 
 
+def _resolve_chat_id(override_chat_id: Optional[int | str]) -> Optional[int | str]:
+    """优先使用传入 chat_id，否则退回到环境变量里的默认 chat id。"""
+
+    if override_chat_id:
+        return override_chat_id
+
+    if TELEGRAM_CHAT_ID:
+        return TELEGRAM_CHAT_ID
+
+    return None
+
+
 def send_telegram_message(
     text: str,
     reply_markup: Optional[dict] = None,
     disable_notification: bool = False,
+    chat_id: Optional[int | str] = None,
 ) -> Optional[dict]:
     """
     使用 Telegram Bot API 发送消息。
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    target_chat_id = _resolve_chat_id(chat_id)
+    if not TELEGRAM_BOT_TOKEN or not target_chat_id:
         print("[telegram] TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，跳过发送。")
         return None
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target_chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_notification": disable_notification,
@@ -138,3 +152,13 @@ def extract_command_from_update(update: dict) -> Optional[str]:
         return None
 
     return text.strip()
+
+
+def extract_chat_id(update: dict) -> Optional[int | str]:
+    """从 update 中提取 chat id，如果不存在则返回 None。"""
+
+    message = update.get("message") or update.get("callback_query", {}).get("message")
+    if message and "chat" in message:
+        return message["chat"].get("id")
+
+    return None
